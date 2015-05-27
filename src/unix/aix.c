@@ -1101,12 +1101,88 @@ void uv_free_cpu_info(uv_cpu_info_t* cpu_infos, int count) {
 }
 
 
-int uv_interface_addresses(uv_interface_address_t** addresses,
-  int* count) {
-  uv_interface_address_t* address;
+int uv_interface_addresses(uv_interface_address_t** addresses, int* count) {
+  uv_interface_address_t* addr;
+  uv_network_interface_t* interfaces = NULL, *interface;
+  int ninterfaces = 0, i, j;
+
+  uv_network_interfaces(&interfaces, &ninterfaces);
+
+  /* Count the number of up and running interfaces */
+  *count = 0;
+  for (i = 0; i < ninterfaces; ++i) {
+    interface = &interfaces[i];
+    if (interface->is_up_and_running) {
+      ++(*count);
+    }
+  }
+  if (!*count) {
+    *addresses = NULL;
+    uv_free_network_interfaces(interfaces, ninterfaces);
+    return 0;
+  }
+
+  /* Alloc the return interface structs */
+  *addresses = (uv_interface_address_t*)
+    malloc(*count * sizeof(uv_interface_address_t));
+  if (!(*addresses)) {
+    uv_free_network_interfaces(interfaces, ninterfaces);
+    return -ENOMEM;
+  }
+
+  /* Populate the return structs */
+  for (i = 0, j = 0; i < ninterfaces; ++i) {
+    interface = &interfaces[i];
+    if (interface->is_up_and_running) {
+      addr = &(*addresses)[j++];
+      /* Meta. */
+      addr->name = strdup(interface->name);
+      addr->is_internal = interface->is_loopback;
+      if (!addr->name) {
+        uv_free_network_interfaces(interfaces, ninterfaces);
+        return -ENOMEM;
+      }
+      /* Address. */
+      if (interface->address.address4.sin_family == AF_INET6) {
+        addr->address.address6 = interface->address.address6;
+      } else {
+        addr->address.address4 = interface->address.address4;
+      }
+      /* Netmask. */
+      if (interface->netmask.netmask4.sin_family == AF_INET6) {
+        addr->netmask.netmask6 = interface->netmask.netmask6;
+      } else {
+        addr->netmask.netmask4 = interface->netmask.netmask4;
+      }
+      /* Physical address. */
+      memcpy(addr->phys_addr, interface->phys_addr, sizeof(addr->phys_addr));
+    }
+  }
+
+  uv_free_network_interfaces(interfaces, ninterfaces);
+  return 0;
+}
+
+
+void uv_free_interface_addresses(uv_interface_address_t* addresses,
+  int count) {
+  int i;
+
+  for (i = 0; i < count; ++i) {
+    free(addresses[i].name);
+  }
+
+  free(addresses);
+}
+
+
+int uv_network_interfaces(uv_network_interface_t** interfaces, int* count) {
+  uv_network_interface_t* interface;
   int sockfd, size = 1;
   struct ifconf ifc;
-  struct ifreq *ifr, *p, flg;
+  struct ifreq *ifr, *p, req;
+  struct sockaddr_dl* sa_addr;
+  int i;
 
   *count = 0;
 
@@ -1123,42 +1199,41 @@ int uv_interface_addresses(uv_interface_address_t** addresses,
   ifc.ifc_len = size;
   if (ioctl(sockfd, SIOCGIFCONF, &ifc) == -1) {
     uv__close(sockfd);
+    free(ifc.ifc_req);
     return -ENOSYS;
   }
 
 #define ADDR_SIZE(p) MAX((p).sa_len, sizeof(p))
 
-  /* Count all up and running ipv4/ipv6 addresses */
+  /* Count the number of interfaces. */
   ifr = ifc.ifc_req;
   while ((char*)ifr < (char*)ifc.ifc_req + ifc.ifc_len) {
     p = ifr;
     ifr = (struct ifreq*)
       ((char*)ifr + sizeof(ifr->ifr_name) + ADDR_SIZE(ifr->ifr_addr));
 
-    if (!(p->ifr_addr.sa_family == AF_INET6 ||
-          p->ifr_addr.sa_family == AF_INET))
+    if (p->ifr_addr.sa_family != AF_INET6 &&
+        p->ifr_addr.sa_family != AF_INET)
       continue;
 
-    memcpy(flg.ifr_name, p->ifr_name, sizeof(flg.ifr_name));
-    if (ioctl(sockfd, SIOCGIFFLAGS, &flg) == -1) {
+    memset(&req, 0, sizeof(req));
+    memcpy(req.ifr_name, p->ifr_name, sizeof(req.ifr_name));
+    if (ioctl(sockfd, SIOCGIFFLAGS, &req) == -1) {
       uv__close(sockfd);
+      free(ifc.ifc_req);
       return -ENOSYS;
     }
-
-    if (!(flg.ifr_flags & IFF_UP && flg.ifr_flags & IFF_RUNNING))
-      continue;
 
     (*count)++;
   }
 
-  /* Alloc the return interface structs */
-  *addresses = (uv_interface_address_t*)
-    malloc(*count * sizeof(uv_interface_address_t));
-  if (!(*addresses)) {
+  *interfaces = malloc(*count * sizeof(**interfaces));
+  if (!(*interfaces)) {
     uv__close(sockfd);
+    free(ifc.ifc_req);
     return -ENOMEM;
   }
-  address = *addresses;
+  interface = *interfaces;
 
   ifr = ifc.ifc_req;
   while ((char*)ifr < (char*)ifc.ifc_req + ifc.ifc_len) {
@@ -1166,53 +1241,141 @@ int uv_interface_addresses(uv_interface_address_t** addresses,
     ifr = (struct ifreq*)
       ((char*)ifr + sizeof(ifr->ifr_name) + ADDR_SIZE(ifr->ifr_addr));
 
-    if (!(p->ifr_addr.sa_family == AF_INET6 ||
-          p->ifr_addr.sa_family == AF_INET))
+    if (p->ifr_addr.sa_family != AF_INET6 &&
+        p->ifr_addr.sa_family != AF_INET)
       continue;
 
-    memcpy(flg.ifr_name, p->ifr_name, sizeof(flg.ifr_name));
-    if (ioctl(sockfd, SIOCGIFFLAGS, &flg) == -1) {
+    memcpy(req.ifr_name, p->ifr_name, sizeof(req.ifr_name));
+    if (ioctl(sockfd, SIOCGIFFLAGS, &req) == -1) {
       uv__close(sockfd);
+      free(ifc.ifc_req);
       return -ENOSYS;
     }
 
-    if (!(flg.ifr_flags & IFF_UP && flg.ifr_flags & IFF_RUNNING))
-      continue;
+    /* Meta. */
+    interface->name = strdup(p->ifr_name);
+    if (!interface->name) {
+      uv__close(sockfd);
+      free(ifc.ifc_req);
+      return -ENOMEM;
+    }
+    interface->is_loopback       = !!(req.ifr_flags & IFF_LOOPBACK);
+    interface->is_up_and_running = !!(req.ifr_flags & (IFF_UP|IFF_RUNNING));
+    interface->is_point_to_point = !!(req.ifr_flags & IFF_POINTOPOINT);
+    interface->is_promiscuous    = !!(req.ifr_flags & IFF_PROMISC);
+    interface->has_broadcast     = !!(req.ifr_flags & IFF_BROADCAST);
+    interface->has_multicast     = !!(req.ifr_flags & IFF_MULTICAST);
 
-    /* All conditions above must match count loop */
-
-    address->name = strdup(p->ifr_name);
-
+    /* Address. */
     if (p->ifr_addr.sa_family == AF_INET6) {
-      address->address.address6 = *((struct sockaddr_in6*) &p->ifr_addr);
+      interface->address.address6 = *((struct sockaddr_in6*) &p->ifr_addr);
     } else {
-      address->address.address4 = *((struct sockaddr_in*) &p->ifr_addr);
+      interface->address.address4 = *((struct sockaddr_in*) &p->ifr_addr);
     }
 
-    /* TODO: Retrieve netmask using SIOCGIFNETMASK ioctl */
+    /* Broadcast or point-to-point. */
+    memset(&req, 0, sizeof(req));
+    memcpy(req.ifr_name, p->ifr_name, sizeof(req.ifr_name));
+    if (ioctl(sockfd, SIOCGIFBRDADDR, &req) != -1) {
+      if (req.ifr_broadaddr.sa_family == AF_INET6) {
+        interface->broadcast.broadcast6 =
+          *((struct sockaddr_in6*) &req.ifr_broadaddr);
+      } else if (req.ifr_broadaddr.sa_family == AF_INET) {
+        interface->broadcast.broadcast4 =
+          *((struct sockaddr_in*) &req.ifr_broadaddr);
+      } else {
+        interface->broadcast.broadcast4.sin_family = AF_UNSPEC;
+      }
+    } else {
+      memset(&req, 0, sizeof(req));
+      memcpy(req.ifr_name, p->ifr_name, sizeof(req.ifr_name));
+      if (ioctl(sockfd, SIOCGIFDSTADDR, &req) != -1) {
+        if (req.ifr_dstaddr.sa_family == AF_INET6) {
+          interface->broadcast.broadcast6 =
+            *((struct sockaddr_in6*) &req.ifr_dstaddr);
+        } else if (req.ifr_dstaddr.sa_family == AF_INET) {
+          interface->broadcast.broadcast4 =
+            *((struct sockaddr_in*) &req.ifr_dstaddr);
+        } else {
+          interface->broadcast.broadcast4.sin_family = AF_UNSPEC;
+        }
+      } else {
+        interface->broadcast.broadcast4.sin_family = AF_UNSPEC;
+      }
+    }
 
-    address->is_internal = flg.ifr_flags & IFF_LOOPBACK ? 1 : 0;
+    /* Netmask. */
+    memset(&req, 0, sizeof(req));
+    memcpy(req.ifr_name, p->ifr_name, sizeof(req.ifr_name));
+    if (ioctl(sockfd, SIOCGIFNETMASK, &req) != -1) {
+      if (req.ifr_addr.sa_family == AF_INET6) {
+        interface->netmask.netmask6 =
+          *((struct sockaddr_in6*) &req.ifr_addr);
+      } else if (req.ifr_addr.sa_family == AF_INET) {
+        interface->netmask.netmask4 =
+          *((struct sockaddr_in*) &req.ifr_addr);
+      } else {
+        interface->netmask.netmask4.sin_family = AF_UNSPEC;
+      }
+    } else {
+      interface->netmask.netmask4.sin_family = AF_UNSPEC;
+    }
 
-    address++;
+    /* Physical address. */
+    interface->phys_addr_len = 0;
+
+    interface++;
+  }
+
+  /* Physical addresses. */
+  for (i = 0; i < *count; i++) {
+    interface = &(*interfaces)[i];
+    ifr = ifc.ifc_req;
+    while ((char*)ifr < (char*)ifc.ifc_req + ifc.ifc_len) {
+      p = ifr;
+      ifr = (struct ifreq*)
+        ((char*)ifr + sizeof(ifr->ifr_name) + ADDR_SIZE(ifr->ifr_addr));
+
+      /* AF_LINK interface entries exist for each AF_INET6/AF_INET interface,
+         so loop through all proper AF_INET6/AF_INET entries and fill in the
+         physical address for any matching interface name with an AF_LINK. */
+      if (p->ifr_addr.sa_family == AF_LINK &&
+          strcmp(p->ifr_name, interface->name) == 0) {
+        sa_addr = (struct sockaddr_dl*)&p->ifr_addr;
+        interface->phys_addr_len = sa_addr->sdl_alen;
+        /* Clamp size to sizeof(interface) */
+        if (interface->phys_addr_len > sizeof(interface->phys_addr)) {
+          interface->phys_addr_len = sizeof(interface->phys_addr);
+        }
+        memcpy(interface->phys_addr, LLADDR(sa_addr), interface->phys_addr_len);
+      }
+    }
+    /* Clear the address buffer because `uv_interface_addresses` copies the
+     * physical address because the output struct has no length/flag.
+     * Prevents copying garbage bytes into the output struct. */
+    if (interface->phys_addr_len == 0) {
+      memset(interface->phys_addr, 0, sizeof(interface->phys_addr));
+    }
   }
 
 #undef ADDR_SIZE
 
   uv__close(sockfd);
+  free(ifc.ifc_req);
   return 0;
 }
 
 
-void uv_free_interface_addresses(uv_interface_address_t* addresses,
-  int count) {
+void uv_free_network_interfaces(uv_network_interface_t* interfaces, int count) {
   int i;
 
-  for (i = 0; i < count; ++i) {
-    free(addresses[i].name);
+  for (i = 0; i < count; i++) {
+    free(interfaces[i].name);
   }
 
-  free(addresses);
+  free(interfaces);
 }
+
 
 void uv__platform_invalidate_fd(uv_loop_t* loop, int fd) {
   struct pollfd* events;
